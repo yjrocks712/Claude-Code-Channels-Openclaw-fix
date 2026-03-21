@@ -1,0 +1,861 @@
+==============================================================================
+ CLAUDE CODE TELEGRAM DAEMON — FULL CONFIG + SETUP GUIDE
+==============================================================================
+
+==============================================================================
+FILE 1: ~/.claude/settings.json
+Purpose: Global Claude Code settings — permissions, model, trusted dirs
+==============================================================================
+
+{
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Read(*)",
+      "Write(*)",
+      "Edit(*)",
+      "Edit(.claude/**)",
+      "WebFetch(*)",
+      "mcp__*",
+      "Agent(*)"
+    ],
+    "deny": []
+  },
+  "defaultMode": "acceptEdits",
+  "trustedDirectories": [
+    "/root",
+    "/home"
+  ],
+  "model": "opus"
+}
+
+==============================================================================
+FILE 2: ~/.claude/settings.local.json
+Purpose: Local overrides — enables the Telegram plugin and extra permissions
+==============================================================================
+
+{
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Read(*)",
+      "Write(*)",
+      "Edit(*)",
+      "WebFetch(*)",
+      "mcp__*",
+      "Agent(*)",
+      "mcp__plugin_telegram_telegram__reply",
+      "Skill(update-config)"
+    ],
+    "deny": []
+  },
+  "enabledPlugins": {
+    "telegram@claude-plugins-official": true
+  }
+}
+
+==============================================================================
+FILE 3: /root/CLAUDE.md
+Purpose: Project-level instructions that Claude always follows (safety rules,
+         memory rules, exit behavior)
+==============================================================================
+
+# CLAUDE.md — Global Instructions
+
+## CRITICAL: File Deletion Safety Rule
+
+**NEVER delete, remove, or overwrite any file without explicit user confirmation — no exceptions.**
+
+Before running ANY of these operations, you MUST ask the user (via Telegram reply or in the terminal) and wait for a clear "yes":
+- `rm`, `rm -rf`, `unlink`, `shred`
+- `git clean`, `git checkout -- <file>`, `git reset --hard`
+- Overwriting a file with `>` or `Write` tool when it replaces significant content
+- `mv` that would overwrite an existing file
+- Any tool or command that permanently destroys data
+
+This rule applies **every single time**, even if:
+- The user previously approved a similar deletion
+- The deletion seems obviously necessary
+- You are cleaning up temp files or build artifacts
+- A tool or script suggests deletion as part of its workflow
+
+**How to ask:** State exactly which file(s) will be deleted and why, then wait for confirmation before proceeding. If communicating via Telegram, use the reply tool to ask.
+
+## Memory Rules
+
+When a session is closing and you are asked to save memories:
+
+- ONLY save information that is important for the LONG TERM and FOREVER
+- DO NOT save temporary tasks, one-off questions, or short-term info
+- DO NOT save information that already exists in files on this system
+- DO NOT duplicate what's already in your memory files
+- Before saving anything, ask yourself: "Will this matter in 6 months?"
+- Examples of what TO save: user preferences, important decisions, system architecture choices, credentials locations, recurring workflows
+- Examples of what NOT to save: "user asked about disk space", "ran apt update", "user said hello", temporary debugging steps
+
+Be extremely selective. Less is more. If in doubt, don't save it.
+
+## Session Exit Rules
+
+Before EVERY session exit — whether you are asked to exit, the daemon is shutting you down, or you decide to close for any reason:
+
+1. Review the conversation that just happened
+2. Apply the Memory Rules (see above) — only save what matters long-term
+3. Save any qualifying memories to your memory files
+4. THEN exit
+
+This applies to ALL exits: manual /exit, daemon timeout shutdown, user asking you to close, or any other reason. Never exit without checking if something important needs to be remembered.
+
+## How to Exit a Session
+When you need to exit, use the `/exit` command — this is Claude Code's built-in exit.
+NEVER use `Bash(exit 0)` or `exit` — that only exits a subprocess, not Claude Code itself.
+Always: send your farewell message on Telegram FIRST, then run `/exit`.
+
+## How to Exit a Session
+When asked to exit or when you decide to close the session:
+1. Send your farewell message on Telegram
+2. As your final action, type exactly: /exit
+The daemon will detect /exit combined with an idle prompt and close the session.
+Do NOT use Bash(exit 0) — that does nothing.
+
+==============================================================================
+FILE 4: ~/.claude/channels/telegram/.env
+Purpose: Telegram bot token for the MCP plugin
+==============================================================================
+
+TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
+
+==============================================================================
+FILE 5: ~/.claude/channels/telegram/access.json
+Purpose: Controls who can message the bot (allowlist of Telegram user IDs)
+==============================================================================
+
+{
+  "dmPolicy": "allowlist",
+  "allowFrom": ["YOUR_USER_ID"],
+  "groups": {},
+  "pending": {}
+}
+
+==============================================================================
+FILE 6: /root/start-claude-telegram.sh
+Purpose: Expect script that launches Claude with the Telegram channel,
+         auto-presses Enter to confirm the channel prompt
+==============================================================================
+
+#!/usr/bin/expect -f
+log_file -a "/var/log/claude-telegram-session.log"
+spawn bash -c "cd /root && claude --channels plugin:telegram@claude-plugins-official"
+expect "Enter to confirm"
+send "\r"
+interact
+exit 0
+
+==============================================================================
+FILE 7: /root/launch-claude.sh
+Purpose: Simpler version of the expect launcher (alternative/backup)
+==============================================================================
+
+#!/usr/bin/expect -f
+spawn claude --channels plugin:telegram@claude-plugins-official
+expect "Enter to confirm"
+send "\r"
+interact
+
+==============================================================================
+FILE 8: /root/claude-telegram-daemon.sh
+Purpose: The main daemon script — polls Telegram for messages when idle,
+         spawns Claude in tmux when a message arrives, monitors inactivity,
+         auto-closes sessions after 1 hour idle, forwards permission prompts
+==============================================================================
+
+#!/usr/bin/env bash
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin:/root/.bun/bin"
+###############################################################################
+# claude-telegram-daemon.sh
+#
+# Keeps Claude Code reachable on Telegram even when your SSH session is closed.
+#
+# How it works:
+#   1. While no Claude session is running, polls Telegram (getUpdates,
+#      timeout=0) to detect new messages.  Updates are NOT acknowledged,
+#      so grammy inside the MCP plugin will re-fetch them on startup.
+#   2. When a message from an allowed user is detected, spawns Claude Code
+#      inside a tmux session with the Telegram MCP channel enabled.
+#   3. Grammy (inside the plugin) takes over Telegram polling; the daemon
+#      stops calling getUpdates to avoid 409 Conflict.
+#   4. Monitors tmux window_activity for inactivity.  After 1 hour of no
+#      activity it asks Claude to persist memory, then tears down the session.
+#   5. Returns to step 1.
+###############################################################################
+set -uo pipefail
+
+# Track prompt forwarder PID for cleanup
+PROMPT_FORWARDER_PID=""
+
+# Flag to suppress session-ended notification after graceful_close
+GRACEFUL_CLOSE_IN_PROGRESS=false
+
+# Cleanup on daemon exit
+cleanup_on_exit() {
+    if [[ -n "${PROMPT_FORWARDER_PID:-}" ]]; then
+        kill "$PROMPT_FORWARDER_PID" 2>/dev/null || true
+    fi
+    if is_session_active 2>/dev/null; then
+        log "Daemon exiting — closing session"
+        graceful_close
+    fi
+}
+trap cleanup_on_exit EXIT
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+TMUX_SESSION="claude-telegram"
+INACTIVITY_TIMEOUT=3600        # seconds (1 hour)
+POLL_INTERVAL=5                # seconds between Telegram polls (idle)
+ACTIVITY_CHECK_INTERVAL=30     # seconds between inactivity checks (active)
+GRACE_PERIOD_SAVE=300          # seconds to let Claude save memory (5 minutes)
+GRACE_PERIOD_EXIT=10           # seconds after /exit before force-kill
+STATE_DIR="$HOME/.claude/channels/telegram"
+LOG_FILE="/var/log/claude-telegram-daemon.log"
+SESSION_LOG="/var/log/claude-telegram-session.log"
+
+# ---------------------------------------------------------------------------
+# Load bot token
+# ---------------------------------------------------------------------------
+BOT_TOKEN=""
+if [[ -f "$STATE_DIR/.env" ]]; then
+    while IFS='=' read -r key val; do
+        [[ "$key" == "TELEGRAM_BOT_TOKEN" ]] && BOT_TOKEN="$val"
+    done < "$STATE_DIR/.env"
+fi
+if [[ -z "$BOT_TOKEN" ]]; then
+    echo "ERROR: No bot token in $STATE_DIR/.env" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Load allowed user IDs from access.json
+# ---------------------------------------------------------------------------
+get_allowed_ids() {
+    python3 -c "
+import json, sys
+try:
+    with open('$STATE_DIR/access.json') as f:
+        data = json.load(f)
+    for uid in data.get('allowFrom', []):
+        print(uid)
+except Exception:
+    pass
+" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Session helpers
+# ---------------------------------------------------------------------------
+is_session_active() {
+    tmux has-session -t "$TMUX_SESSION" 2>/dev/null
+}
+
+start_session() {
+    log "Starting Claude Code session in tmux"
+    tmux new-session -d -s "$TMUX_SESSION" "/root/start-claude-telegram.sh"
+    log "Session started"
+
+    # Start prompt forwarder in background
+    prompt_forwarder_loop &
+    PROMPT_FORWARDER_PID=$!
+    log "Prompt forwarder started (PID $PROMPT_FORWARDER_PID)"
+}
+
+graceful_close() {
+    GRACEFUL_CLOSE_IN_PROGRESS=true
+    log "Inactivity timeout reached — closing session"
+
+    # Stop prompt forwarder
+    if [[ -n "${PROMPT_FORWARDER_PID:-}" ]]; then
+        kill "$PROMPT_FORWARDER_PID" 2>/dev/null || true
+        wait "$PROMPT_FORWARDER_PID" 2>/dev/null || true
+        log "Prompt forwarder stopped"
+    fi
+
+    # Ask Claude to save anything important
+    tmux send-keys -t "$TMUX_SESSION" \
+        "Save anything important from this conversation to your long-term memory. This session is closing due to 1 hour of inactivity." Enter
+    sleep "$GRACE_PERIOD_SAVE"
+
+    # Send /exit
+    tmux send-keys -t "$TMUX_SESSION" "/exit" Enter
+    sleep "$GRACE_PERIOD_EXIT"
+
+    # Force kill if still alive
+    if is_session_active; then
+        log "Session did not exit cleanly — force killing"
+        tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+    fi
+    log "Session closed"
+}
+
+# ---------------------------------------------------------------------------
+# Telegram polling (only used when no session is active)
+# ---------------------------------------------------------------------------
+has_pending_messages() {
+    local allowed_ids
+    allowed_ids=$(get_allowed_ids)
+
+    local response
+    response=$(curl -s --max-time 10 \
+        "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?timeout=0&limit=5" 2>/dev/null) || {
+        echo "error"
+        return
+    }
+
+    echo "$response" | python3 -c "
+import sys, json
+try:
+    allowed = set('''$allowed_ids'''.strip().split())
+    data = json.load(sys.stdin)
+    if not data.get('ok'):
+        print('no')
+        sys.exit(0)
+    for update in data.get('result', []):
+        msg = update.get('message') or update.get('edited_message') or {}
+        chat = msg.get('chat', {})
+        frm  = msg.get('from', {})
+        if str(chat.get('id', '')) in allowed or str(frm.get('id', '')) in allowed:
+            print('yes')
+            sys.exit(0)
+    print('no')
+except Exception as e:
+    print('no', file=sys.stderr)
+    print('no')
+" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Permission prompt forwarder
+# ---------------------------------------------------------------------------
+PROMPT_POLL_INTERVAL=5         # seconds between checks for prompts
+LAST_PROMPT_CHECK=""           # track last prompt to avoid duplicates
+PENDING_PROMPT_MESSAGE_ID=""   # telegram message_id awaiting reply
+
+# Get the user's chat ID from access.json
+get_user_chat_id() {
+    python3 -c "
+import json
+try:
+    with open('$STATE_DIR/access.json') as f:
+        data = json.load(f)
+    ids = data.get('allowFrom', [])
+    if ids:
+        print(ids[0])
+except Exception:
+    pass
+" 2>/dev/null
+}
+
+# Get tmux pane content and check for permission prompts
+check_for_permission_prompt() {
+    if ! is_session_active; then
+        return
+    fi
+
+    local pane_content
+    pane_content=$(tmux capture-pane -t "$TMUX_SESSION" -p 2>/dev/null) || return
+
+    # Check for permission prompt patterns
+    if echo "$pane_content" | grep -qE "(Esc to cancel)"; then
+        local prompt_hash
+        prompt_hash=$(echo "$pane_content" | sha256sum | cut -d' ' -f1)
+
+        # Avoid re-sending the same prompt
+        if [[ "$prompt_hash" == "$LAST_PROMPT_CHECK" ]]; then
+            return
+        fi
+
+        LAST_PROMPT_CHECK="$prompt_hash"
+        log "Permission prompt detected — forwarding to Telegram"
+        forward_prompt_to_telegram "$pane_content"
+    fi
+}
+
+# Send prompt to Telegram and poll for reply
+forward_prompt_to_telegram() {
+    local pane_content="$1"
+    local user_chat_id
+    user_chat_id=$(get_user_chat_id)
+
+    if [[ -z "$user_chat_id" ]]; then
+        log "ERROR: No user chat ID found"
+        return
+    fi
+
+    # Extract just the visible prompt (last 30 lines to catch full prompt + options)
+    local prompt_text
+    prompt_text=$(echo "$pane_content" | grep -B 20 "Esc to cancel" | tail -25)
+
+    # Send to Telegram
+    local telegram_msg
+    telegram_msg="⚠️ **Permission Prompt**
+
+\`\`\`
+$(echo "$prompt_text")
+\`\`\`
+
+Reply with the number to select."
+
+    local send_response
+    send_response=$(curl -s -X POST \
+        "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"chat_id\": $user_chat_id,
+            \"text\": $(echo "$telegram_msg" | jq -Rs .)
+        }" 2>/dev/null)
+
+    # Extract message_id from response
+    PENDING_PROMPT_MESSAGE_ID=$(echo "$send_response" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    if data.get('ok'):
+        print(data['result'].get('message_id', ''))
+except:
+    pass
+" 2>/dev/null)
+
+    if [[ -z "$PENDING_PROMPT_MESSAGE_ID" ]]; then
+        log "Failed to send prompt to Telegram"
+        return
+    fi
+
+    log "Prompt sent (message_id: $PENDING_PROMPT_MESSAGE_ID) — waiting for reply"
+
+    # Auto-approve the prompt immediately
+    log "Auto-approving prompt (sending 1)"
+    tmux send-keys -t "$TMUX_SESSION" Enter
+    log "Auto-approved"
+    PENDING_PROMPT_MESSAGE_ID=""
+    LAST_PROMPT_CHECK=""
+}
+
+# Background loop to check for prompts while session is active
+prompt_forwarder_loop() {
+    while is_session_active; do
+        check_for_permission_prompt
+        sleep "$PROMPT_POLL_INTERVAL"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Inactivity monitor (uses tmux window_activity)
+# ---------------------------------------------------------------------------
+check_inactivity() {
+    if ! is_session_active; then
+        return
+    fi
+
+    local activity_ts
+    activity_ts=$(tmux display-message -t "$TMUX_SESSION" -p '#{window_activity}' 2>/dev/null) || {
+        # tmux command failed — session may have just died
+        return
+    }
+
+    if [[ -z "$activity_ts" ]]; then
+        return
+    fi
+
+    local now
+    now=$(date +%s)
+    local idle=$((now - activity_ts))
+
+    if [[ $idle -ge $INACTIVITY_TIMEOUT ]]; then
+        graceful_close
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Send session-ended notification via Telegram
+# ---------------------------------------------------------------------------
+send_session_ended_notification() {
+    local user_chat_id
+    user_chat_id=$(get_user_chat_id)
+    if [[ -z "$user_chat_id" ]]; then
+        log "Cannot send session-ended notification — no chat ID"
+        return
+    fi
+    curl -s -X POST \
+        "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        -H "Content-Type: application/json" \
+        -d "{\"chat_id\": $user_chat_id, \"text\": \"Session ended. Send a message to start a new one.\"}" \
+        >/dev/null 2>&1
+    log "Session-ended notification sent"
+}
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+log "Daemon starting (PID $$)"
+log "Inactivity timeout: ${INACTIVITY_TIMEOUT}s | Poll interval: ${POLL_INTERVAL}s"
+
+SESSION_WAS_ACTIVE=false
+
+while true; do
+    if is_session_active; then
+        # ---- Session is active: monitor for inactivity only ----
+        SESSION_WAS_ACTIVE=true
+
+        # ---- Check if Claude typed /exit and is idle ----
+        pane_tail=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -50 2>/dev/null)
+        last_five_nonblank=$(echo "$pane_tail" | sed '/^[[:space:]]*$/d' | tail -5)
+        if echo "$pane_tail" | grep -q "/exit" && echo "$last_five_nonblank" | grep -q "❯"; then
+            sleep 10
+            pane_recheck=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -50 2>/dev/null)
+            last_five_nonblank_recheck=$(echo "$pane_recheck" | sed '/^[[:space:]]*$/d' | tail -5)
+            if echo "$pane_recheck" | grep -q "/exit" && echo "$last_five_nonblank_recheck" | grep -q "❯"; then
+                log "Detected /exit + idle prompt — closing session"
+                tmux kill-session -t "$TMUX_SESSION" 2>/dev/null
+                sleep 1
+                continue
+            fi
+        fi
+
+        check_inactivity
+        sleep "$ACTIVITY_CHECK_INTERVAL"
+    else
+        # ---- Session just ended: notify if not from graceful_close ----
+        if [[ "$SESSION_WAS_ACTIVE" == true ]]; then
+            SESSION_WAS_ACTIVE=false
+            if [[ "$GRACEFUL_CLOSE_IN_PROGRESS" == true ]]; then
+                GRACEFUL_CLOSE_IN_PROGRESS=false
+                log "Session ended via graceful_close — skipping notification"
+            else
+                log "Session ended (voluntary exit or crash) — notifying user"
+                send_session_ended_notification
+            fi
+        fi
+
+        # ---- No session: poll Telegram for new messages ----
+        result=$(has_pending_messages)
+        case "$result" in
+            yes)
+                log "Pending message detected — spinning up Claude"
+                start_session
+                # Wait for Claude + grammy to initialize before looping back
+                sleep 15
+                ;;
+            error)
+                log "Telegram poll error — retrying in ${POLL_INTERVAL}s"
+                sleep "$POLL_INTERVAL"
+                ;;
+            *)
+                sleep "$POLL_INTERVAL"
+                ;;
+        esac
+    fi
+done
+
+==============================================================================
+FILE 9: /etc/systemd/system/claude-telegram.service
+Purpose: systemd unit to run the daemon on boot and auto-restart on failure
+==============================================================================
+
+[Unit]
+Description=Claude Code Telegram Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/root/claude-telegram-daemon.sh
+Restart=always
+RestartSec=10
+Environment=HOME=/root
+Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Logging
+StandardOutput=append:/var/log/claude-telegram-daemon.log
+StandardError=append:/var/log/claude-telegram-daemon.log
+
+# Hardening
+NoNewPrivileges=false
+ProtectSystem=false
+
+[Install]
+WantedBy=multi-user.target
+
+
+##############################################################################
+##############################################################################
+##
+##  STEP-BY-STEP SETUP GUIDE (Fresh Linux VPS)
+##
+##############################################################################
+##############################################################################
+
+PREREQUISITES:
+- A Linux VPS (Ubuntu 22.04+ recommended) with root access
+- An Anthropic API key (for Claude Code)
+- A Telegram bot token (from @BotFather)
+- Your Telegram user ID (from @userinfobot)
+
+------------------------------------------------------------------------------
+STEP 1: Install system dependencies
+------------------------------------------------------------------------------
+
+apt update && apt install -y tmux expect python3 curl jq
+
+------------------------------------------------------------------------------
+STEP 2: Install Claude Code
+------------------------------------------------------------------------------
+
+# Install Node.js (if not already installed)
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt install -y nodejs
+
+# Install Claude Code globally
+npm install -g @anthropic-ai/claude-code
+
+# Log in / set your API key
+# Either set ANTHROPIC_API_KEY in your environment:
+export ANTHROPIC_API_KEY="YOUR_ANTHROPIC_API_KEY"
+# Or run `claude` once interactively to authenticate
+
+# Add to ~/.bashrc or ~/.profile for persistence:
+echo 'export ANTHROPIC_API_KEY="YOUR_ANTHROPIC_API_KEY"' >> ~/.bashrc
+
+------------------------------------------------------------------------------
+STEP 3: Create directory structure
+------------------------------------------------------------------------------
+
+mkdir -p ~/.claude/channels/telegram
+
+------------------------------------------------------------------------------
+STEP 4: Create the Telegram bot token file
+------------------------------------------------------------------------------
+
+cat > ~/.claude/channels/telegram/.env << 'EOF'
+TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
+EOF
+
+------------------------------------------------------------------------------
+STEP 5: Create the access control file
+------------------------------------------------------------------------------
+
+# Replace YOUR_USER_ID with your numeric Telegram user ID
+cat > ~/.claude/channels/telegram/access.json << 'EOF'
+{
+  "dmPolicy": "allowlist",
+  "allowFrom": ["YOUR_USER_ID"],
+  "groups": {},
+  "pending": {}
+}
+EOF
+
+------------------------------------------------------------------------------
+STEP 6: Create Claude Code settings
+------------------------------------------------------------------------------
+
+cat > ~/.claude/settings.json << 'SETTINGS'
+{
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Read(*)",
+      "Write(*)",
+      "Edit(*)",
+      "Edit(.claude/**)",
+      "WebFetch(*)",
+      "mcp__*",
+      "Agent(*)"
+    ],
+    "deny": []
+  },
+  "defaultMode": "acceptEdits",
+  "trustedDirectories": [
+    "/root",
+    "/home"
+  ],
+  "model": "opus"
+}
+SETTINGS
+
+cat > ~/.claude/settings.local.json << 'SETTINGS'
+{
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Read(*)",
+      "Write(*)",
+      "Edit(*)",
+      "WebFetch(*)",
+      "mcp__*",
+      "Agent(*)",
+      "mcp__plugin_telegram_telegram__reply",
+      "Skill(update-config)"
+    ],
+    "deny": []
+  },
+  "enabledPlugins": {
+    "telegram@claude-plugins-official": true
+  }
+}
+SETTINGS
+
+------------------------------------------------------------------------------
+STEP 7: Create CLAUDE.md (project instructions)
+------------------------------------------------------------------------------
+
+Create /root/CLAUDE.md with your custom instructions. This file is loaded
+into every Claude session and controls Claude's behavior. See the contents
+above for the full example. Key sections to include:
+- File deletion safety rules
+- Memory rules (what to save/not save)
+- Session exit rules (save memories before exiting)
+- Exit instructions (use /exit, not Bash exit)
+
+------------------------------------------------------------------------------
+STEP 8: Create the expect launcher script
+------------------------------------------------------------------------------
+
+cat > /root/start-claude-telegram.sh << 'EOF'
+#!/usr/bin/expect -f
+log_file -a "/var/log/claude-telegram-session.log"
+spawn bash -c "cd /root && claude --channels plugin:telegram@claude-plugins-official"
+expect "Enter to confirm"
+send "\r"
+interact
+exit 0
+EOF
+
+chmod +x /root/start-claude-telegram.sh
+
+------------------------------------------------------------------------------
+STEP 9: Create the daemon script
+------------------------------------------------------------------------------
+
+Copy the full contents of claude-telegram-daemon.sh (shown above) to
+/root/claude-telegram-daemon.sh, then:
+
+chmod +x /root/claude-telegram-daemon.sh
+
+Key config variables you may want to adjust:
+- INACTIVITY_TIMEOUT=3600    (how long before auto-closing idle sessions)
+- POLL_INTERVAL=5            (how often to check Telegram when idle)
+- GRACE_PERIOD_SAVE=300      (time given to Claude to save memories on close)
+
+------------------------------------------------------------------------------
+STEP 10: Create the systemd service
+------------------------------------------------------------------------------
+
+cat > /etc/systemd/system/claude-telegram.service << 'EOF'
+[Unit]
+Description=Claude Code Telegram Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/root/claude-telegram-daemon.sh
+Restart=always
+RestartSec=10
+Environment=HOME=/root
+Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+StandardOutput=append:/var/log/claude-telegram-daemon.log
+StandardError=append:/var/log/claude-telegram-daemon.log
+NoNewPrivileges=false
+ProtectSystem=false
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+------------------------------------------------------------------------------
+STEP 11: Enable and start the service
+------------------------------------------------------------------------------
+
+systemctl daemon-reload
+systemctl enable claude-telegram
+systemctl start claude-telegram
+
+------------------------------------------------------------------------------
+STEP 12: Verify it's running
+------------------------------------------------------------------------------
+
+# Check service status
+systemctl status claude-telegram
+
+# Watch the daemon log
+tail -f /var/log/claude-telegram-daemon.log
+
+# Send a message to your bot on Telegram — within ~5 seconds the daemon
+# should detect it and spin up a Claude session
+
+------------------------------------------------------------------------------
+STEP 13: Useful commands for ongoing management
+------------------------------------------------------------------------------
+
+# View daemon logs
+tail -100 /var/log/claude-telegram-daemon.log
+
+# View session logs
+tail -100 /var/log/claude-telegram-session.log
+
+# Restart the daemon
+systemctl restart claude-telegram
+
+# Attach to the live Claude tmux session (for debugging)
+tmux attach -t claude-telegram
+
+# Check if a Claude session is active
+tmux has-session -t claude-telegram 2>/dev/null && echo "Active" || echo "Inactive"
+
+------------------------------------------------------------------------------
+ARCHITECTURE OVERVIEW
+------------------------------------------------------------------------------
+
+    You (Telegram) ──► Telegram Bot API
+                            │
+                            ▼
+    ┌─────────────────────────────────────────┐
+    │  claude-telegram-daemon.sh (systemd)    │
+    │                                         │
+    │  When idle:                              │
+    │    polls getUpdates every 5s             │
+    │    if message from allowed user →        │
+    │      spawn Claude in tmux               │
+    │                                         │
+    │  When active:                            │
+    │    Grammy (MCP plugin) handles Telegram  │
+    │    Daemon monitors inactivity            │
+    │    After 1hr idle → save + /exit         │
+    │    Detects /exit → kill tmux session     │
+    │    Auto-approves permission prompts      │
+    └─────────────────────────────────────────┘
+              │
+              ▼
+    ┌─────────────────────────────────────────┐
+    │  tmux session "claude-telegram"         │
+    │    └─ start-claude-telegram.sh (expect) │
+    │         └─ claude --channels telegram   │
+    │              └─ Grammy MCP plugin       │
+    │                   └─ reads/sends msgs   │
+    └─────────────────────────────────────────┘
+
+Key design decisions:
+- Expect script auto-confirms the channel prompt (no human needed)
+- Daemon does NOT acknowledge getUpdates — Grammy re-fetches them
+- Permission prompts are auto-approved (all permissions pre-allowed)
+- Inactivity = 1 hour of no tmux window_activity
+- Graceful close: asks Claude to save memories → /exit → force-kill
+- systemd auto-restarts the daemon on crash
