@@ -1,6 +1,6 @@
 # Claude Code Telegram Integration (OpenClaw-like Setup)
 
-Anthropic has released Claude Code Channels, which allows connecting Claude Code to Telegram. With this update, we get very close to an [OpenClaw](https://github.com/anthropics/openclaw)-like implementation using an official Anthropic Claude subscription — without relying on third-party wrappers.
+Anthropic has released Claude Code Channels, which allows connecting Claude Code to Telegram. With this update, we get very close to an [OpenClaw]-like implementation using an official Anthropic Claude subscription — without relying on third-party wrappers.
 
 However, out of the box, the Telegram channel integration requires some fixes and automation to work smoothly as a persistent, headless AI assistant. This project provides those fixes.
 
